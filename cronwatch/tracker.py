@@ -1,67 +1,66 @@
-"""Job execution tracker — records start/end times and detects overruns."""
+"""Job run tracking: records start/finish times and exit codes for cron jobs."""
 
-import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
-
-from cronwatch.config import JobConfig
 
 
 @dataclass
 class JobRun:
     job_name: str
-    start_time: float = field(default_factory=time.time)
-    end_time: Optional[float] = None
+    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: Optional[datetime] = None
     exit_code: Optional[int] = None
 
-    @property
-    def duration(self) -> Optional[float]:
-        if self.end_time is None:
-            return None
-        return self.end_time - self.start_time
+    def duration(self) -> float:
+        """Return elapsed seconds; uses now if the job is still running."""
+        end = self.finished_at or datetime.now(timezone.utc)
+        return (end - self.started_at).total_seconds()
 
-    @property
     def is_complete(self) -> bool:
-        return self.end_time is not None
+        return self.finished_at is not None
 
-    @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0
+        return self.is_complete() and self.exit_code == 0
 
 
 class JobTracker:
-    """Tracks active and historical job runs."""
+    """Thread-safe store for active and historical job runs."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._active: dict[str, JobRun] = {}
         self._history: list[JobRun] = []
+        self._unalerted: list[JobRun] = []
 
     def start(self, job_name: str) -> JobRun:
-        if job_name in self._active:
-            raise ValueError(f"Job '{job_name}' is already running.")
         run = JobRun(job_name=job_name)
-        self._active[job_name] = run
+        self._active[run.run_id] = run
         return run
 
-    def finish(self, job_name: str, exit_code: int) -> JobRun:
-        if job_name not in self._active:
-            raise KeyError(f"No active run found for job '{job_name}'.")
-        run = self._active.pop(job_name)
-        run.end_time = time.time()
+    def finish(self, run_id: str, exit_code: int) -> Optional[JobRun]:
+        run = self._active.pop(run_id, None)
+        if run is None:
+            return None
+        run.finished_at = datetime.now(timezone.utc)
         run.exit_code = exit_code
         self._history.append(run)
+        self._unalerted.append(run)
         return run
-
-    def is_overrun(self, job_name: str, config: JobConfig) -> bool:
-        if config.max_duration is None:
-            return False
-        if job_name not in self._active:
-            return False
-        elapsed = time.time() - self._active[job_name].start_time
-        return elapsed > config.max_duration
 
     def active_runs(self) -> list[JobRun]:
         return list(self._active.values())
 
     def history(self) -> list[JobRun]:
         return list(self._history)
+
+    def drain_unalerted(self) -> list[JobRun]:
+        """Return and clear the list of completed-but-not-yet-alerted runs."""
+        runs, self._unalerted = self._unalerted, []
+        return runs
+
+    def get_run(self, run_id: str) -> Optional[JobRun]:
+        return self._active.get(run_id) or next(
+            (r for r in self._history if r.run_id == run_id), None
+        )
