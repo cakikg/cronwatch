@@ -67,3 +67,11 @@ class AlertDispatcher:
 
     def all_alerts(self) -> list[Alert]:
         return list(self._alerts)
+
+    def alerts_for_job(self, job_name: str) -> list[Alert]:
+        """Return all alerts recorded for a specific job name."""
+        return [a for a in self._alerts if a.job_name == job_name]
+
+    def clear_alerts(self) -> None:
+        """Discard all stored alerts, e.g. after they have been reported."""
+        self._alerts.clear()
