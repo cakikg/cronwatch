@@ -39,6 +39,15 @@ def alert():
     return Alert(alert_type=AlertType.FAILURE, job_name="backup", message="failed")
 
 
+def _open_breaker(breaker, handler, alert, config):
+    """Helper: drive the breaker into OPEN state by triggering threshold failures."""
+    handler.side_effect = RuntimeError("smtp down")
+    for _ in range(config.failure_threshold):
+        with pytest.raises(RuntimeError):
+            breaker(alert)
+    handler.side_effect = None
+
+
 def test_initial_state_is_closed(breaker):
     assert breaker.state == BreakerState.CLOSED
 
@@ -57,23 +66,16 @@ def test_opens_after_threshold_failures(breaker, handler, alert, config):
 
 
 def test_suppresses_alert_when_open(breaker, handler, alert, config):
-    handler.side_effect = RuntimeError("smtp down")
-    for _ in range(config.failure_threshold):
-        with pytest.raises(RuntimeError):
-            breaker(alert)
-    handler.reset_mock(side_effect=True)
+    _open_breaker(breaker, handler, alert, config)
+    handler.reset_mock()
     breaker(alert)  # Should be suppressed — no call, no exception.
     handler.assert_not_called()
 
 
 def test_transitions_to_half_open_after_timeout(breaker, handler, alert, config, clock):
     _, t = clock
-    handler.side_effect = RuntimeError()
-    for _ in range(config.failure_threshold):
-        with pytest.raises(RuntimeError):
-            breaker(alert)
+    _open_breaker(breaker, handler, alert, config)
     t[0] += config.recovery_timeout + 1
-    handler.side_effect = None
     breaker(alert)
     # After one success in HALF_OPEN with success_threshold=2, still HALF_OPEN.
     assert breaker.state == BreakerState.HALF_OPEN
@@ -81,22 +83,26 @@ def test_transitions_to_half_open_after_timeout(breaker, handler, alert, config,
 
 def test_closes_after_enough_successes_in_half_open(breaker, handler, alert, config, clock):
     _, t = clock
-    handler.side_effect = RuntimeError()
-    for _ in range(config.failure_threshold):
-        with pytest.raises(RuntimeError):
-            breaker(alert)
+    _open_breaker(breaker, handler, alert, config)
     t[0] += config.recovery_timeout + 1
-    handler.side_effect = None
     for _ in range(config.success_threshold):
         breaker(alert)
     assert breaker.state == BreakerState.CLOSED
 
 
 def test_reset_returns_to_closed(breaker, handler, alert, config):
-    handler.side_effect = RuntimeError()
-    for _ in range(config.failure_threshold):
-        with pytest.raises(RuntimeError):
-            breaker(alert)
+    _open_breaker(breaker, handler, alert, config)
     assert breaker.state == BreakerState.OPEN
     breaker.reset()
     assert breaker.state == BreakerState.CLOSED
+
+
+def test_reopens_on_failure_in_half_open(breaker, handler, alert, config, clock):
+    """A failure during HALF_OPEN should immediately reopen the breaker."""
+    _, t = clock
+    _open_breaker(breaker, handler, alert, config)
+    t[0] += config.recovery_timeout + 1
+    handler.side_effect = RuntimeError("still down")
+    with pytest.raises(RuntimeError):
+        breaker(alert)
+    assert breaker.state == BreakerState.OPEN
